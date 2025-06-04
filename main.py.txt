@@ -2,11 +2,12 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import openai
+import os
 
 app = FastAPI()
 
-# Set your OpenAI API key (replace with your own!)
-openai.api_key = "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"  # Secure this in prod
+# Get your OpenAI API key from the environment variable (much safer)
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class DocumentChunk(BaseModel):
     content: str
@@ -50,7 +51,7 @@ async def ask_question(req: QuestionRequest):
 
     # Call OpenAI to get the answer
     completion = openai.chat.completions.create(
-        model="gpt-4o",  # Or your preferred model
+        model="gpt-4o",  # Or "gpt-3.5-turbo" if preferred
         messages=messages
     )
     answer = completion.choices[0].message.content.strip()
@@ -62,4 +63,3 @@ async def ask_question(req: QuestionRequest):
         "answer": answer,
         "confidence": confidence
     }
-
