@@ -6,7 +6,7 @@ import openai
 app = FastAPI()
 
 # Set your OpenAI API key (replace with your own!)
-openai.api_key = "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"  # Secure this in prod
+openai.api_key = "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"  # Secure this in prod
 
 class DocumentChunk(BaseModel):
     content: str
