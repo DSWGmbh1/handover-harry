@@ -53,48 +53,43 @@ async def ask_question(req: QuestionRequest):
         for c in filtered_chunks
     )
 
-# Step 2: Build enhanced system prompt
-context_text = "\n\n".join(
-    f"From {c.filename}, chunk {c.chunk_index} (similarity {c.similarity:.2f}):\n{c.content}"
-    for c in filtered_chunks
-)
+    # Step 2: Build enhanced system prompt
+    system_prompt = (
+        f"You are a highly intelligent assistant for construction handover documentation. "
+        f"Use only the information provided in the CONTEXT below. "
+        f"Answer the user's question thoroughly in {req.user_language}. "
+        f"Do not make anything up. If there is not enough information, say: "
+        f"'The provided documents do not contain enough information to answer this question.'\n\n"
+        
+        f"When answering:\n"
+        f"- Be clear, structured, and helpful.\n"
+        f"- Provide a complete answer — not just partial.\n"
+        f"- If relevant, include:\n"
+        f"    • What the system is and where it's located\n"
+        f"    • Maintenance or replacement schedules\n"
+        f"    • Installation or usage guidance\n"
+        f"    • Any helpful actions (e.g., setting reminders)\n"
+        f"- Anticipate and answer likely follow-up questions the user may ask.\n"
+        f"- Include references to the documents if helpful.\n"
+        f"- End with a short list of suggested next questions the user could ask to continue exploring their handover information.\n\n"
 
-system_prompt = (
-    f"You are a highly intelligent assistant for construction handover documentation. "
-    f"Use only the information provided in the CONTEXT below. "
-    f"Answer the user's question thoroughly in {{req.language}}. "
-    f"Do not make anything up. If there is not enough information, say: "
-    f'The provided documents do not contain enough information to answer this question.\n\n'
-
-    f"When answering:\n"
-    f"- Be clear, structured, and helpful.\n"
-    f"- Provide a complete answer – not just partial.\n"
-    f"- If relevant, include:\n"
-    f"  * What the system is and where it's located\n"
-    f"  * Maintenance or replacement schedules\n"
-    f"  * Installation or usage guidance\n"
-    f"  * Any helpful actions (e.g., setting reminders)\n"
-    f"- Anticipate and answer likely follow-up questions the user may ask.\n"
-    f"- Include references to the documents if helpful.\n"
-    f"- End with a short list of suggested next questions the user could ask to continue exploring their handover information.\n\n"
-
-    f"--- CONTEXT START ---\n{context_text}\n--- CONTEXT END ---"
-)
-
-# Step 3: Call GPT-4o
-try:
-    completion = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": req.question},
-        ]
+        f"--- CONTEXT START ---\n{context_text}\n--- CONTEXT END ---"
     )
 
-    full_response = completion.choices[0].message.content.strip()
+    # Step 3: Call GPT-4o
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": req.question}
+            ]
+        )
+        full_response = completion.choices[0].message["content"].strip()
+    except Exception as e:
+        return {"error": f"OpenAI API error: {str(e)}"}
 
-    # Step 4: Extract answer and suggestions (optional step)
-    # You can split suggestions if you format them as a list at the end of the assistant's answer
+    # Step 4: Extract answer and suggestions
     if "Suggested next questions:" in full_response:
         answer, suggestions_text = full_response.split("Suggested next questions:", 1)
         suggested_next_questions = [
@@ -122,7 +117,3 @@ try:
         ],
         "suggested_next_questions": suggested_next_questions
     }
-
-
-
-
