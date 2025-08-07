@@ -54,27 +54,28 @@ async def ask_question(req: QuestionRequest):
     )
 
     # Step 2: Build enhanced system prompt
-    system_prompt = (
-        f"You are a highly intelligent assistant for construction handover documentation. "
-        f"Use only the information provided in the CONTEXT below. "
-        f"Answer the user's question thoroughly in {req.user_language}. "
-        f"Do not make anything up. If there is not enough information, say: "
-        f"'The provided documents do not contain enough information to answer this question.'\n\n"
-        
-        f"When answering:\n"
-        f"- Be clear, structured, and helpful.\n"
-        f- Provide a complete answer - not just partial.\n"
-        f"- If relevant, include:\n"
-        f"    • What the system is and where it's located\n"
-        f"    • Maintenance or replacement schedules\n"
-        f"    • Installation or usage guidance\n"
-        f"    • Any helpful actions (e.g., setting reminders)\n"
-        f"- Anticipate and answer likely follow-up questions the user may ask.\n"
-        f"- Include references to the documents if helpful.\n"
-        f"- End with a short list of suggested next questions the user could ask to continue exploring their handover information.\n\n"
+system_prompt = (
+    f"You are a highly intelligent assistant for construction handover documentation. "
+    f"Use only the information provided in the CONTEXT below. "
+    f"Answer the user's question thoroughly in {req.language}. "
+    f"Do not make anything up. If there is not enough information, say: "
+    f'The provided documents do not contain enough information to answer this question.\n\n'
 
-        f"- Provide a complete answer - not just partial.\n"
-    )
+    f"When answering:\n"
+    f"- Be clear, structured, and helpful.\n"
+    f"- Provide a complete answer - not just partial.\n"
+    f"- If relevant, include:\n"
+    f"  • What the system is and where it's located\n"
+    f"  • Maintenance or replacement schedules\n"
+    f"  • Installation or usage guidance\n"
+    f"  • Any helpful actions (e.g., setting reminders)\n"
+    f"- Anticipate and answer likely follow-up questions the user may ask.\n"
+    f"- Include references to the documents if helpful.\n"
+    f"- End with a short list of suggested next questions the user could ask to continue exploring their handover information.\n\n"
+
+    f"--- CONTEXT START ---\n{context_text}\n--- CONTEXT END ---"
+)
+
 
     # Step 3: Call GPT-4o
     try:
@@ -118,5 +119,6 @@ async def ask_question(req: QuestionRequest):
         ],
         "suggested_next_questions": suggested_next_questions
     }
+
 
 
