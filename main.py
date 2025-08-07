@@ -63,7 +63,7 @@ async def ask_question(req: QuestionRequest):
         
         f"When answering:\n"
         f"- Be clear, structured, and helpful.\n"
-        f- Provide a complete answer — not just partial.\n"
+        f- Provide a complete answer - not just partial.\n"
         f"- If relevant, include:\n"
         f"    • What the system is and where it's located\n"
         f"    • Maintenance or replacement schedules\n"
@@ -73,7 +73,7 @@ async def ask_question(req: QuestionRequest):
         f"- Include references to the documents if helpful.\n"
         f"- End with a short list of suggested next questions the user could ask to continue exploring their handover information.\n\n"
 
-        f"--- CONTEXT START ---\n{context_text}\n--- CONTEXT END ---"
+        f"- Provide a complete answer - not just partial.\n"
     )
 
     # Step 3: Call GPT-4o
@@ -118,4 +118,5 @@ async def ask_question(req: QuestionRequest):
         ],
         "suggested_next_questions": suggested_next_questions
     }
+
 
