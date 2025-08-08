@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import openai
 import os
@@ -12,48 +12,80 @@ import re
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
-app = FastAPI()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Construction Document Q&A API", version="1.0.0")
+
+# Initialize OpenAI client (updated for newer versions)
+try:
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    if not openai.api_key:
+        logger.warning("OpenAI API key not found in environment variables")
+except Exception as e:
+    logger.error(f"Error initializing OpenAI: {e}")
 
 # Initialize specialized construction document embeddings
-construction_embedder = SentenceTransformer('all-MiniLM-L6-v2')
+try:
+    construction_embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("Construction embedder initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing SentenceTransformer: {e}")
+    construction_embedder = None
 
 # ChromaDB for vector storage with construction-specific collections
-chroma_client = chromadb.Client(Settings(
-    chroma_db_impl="duckdb+parquet",
-    persist_directory="./construction_docs_db"
-))
+try:
+    chroma_client = chromadb.Client(Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory="./construction_docs_db"
+    ))
+    logger.info("ChromaDB client initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing ChromaDB: {e}")
+    chroma_client = None
 
 # ---------- Enhanced Models ----------
 class DocumentChunk(BaseModel):
-    content: str
-    filename: str
-    chunk_index: int
-    similarity: float
-    document_type: str  # plans, manual, warranty, inspection, etc.
-    section_type: Optional[str] = None  # electrical, plumbing, hvac, etc.
-    page: Optional[int] = None
-    extracted_entities: List[Dict[str, Any]] = []
-    visual_elements: List[Dict[str, Any]] = []  # For plans/diagrams
-    coordinates: Optional[Dict[str, float]] = None  # For spatial queries
+    content: str = Field(..., description="The text content of the document chunk")
+    filename: str = Field(..., description="Name of the source document")
+    chunk_index: int = Field(..., description="Index of this chunk within the document")
+    similarity: float = Field(..., ge=0.0, le=1.0, description="Similarity score to the query")
+    document_type: str = Field(..., description="Type of document (plans, manual, warranty, etc.)")
+    section_type: Optional[str] = Field(None, description="Section type (electrical, plumbing, hvac, etc.)")
+    page: Optional[int] = Field(None, description="Page number in the original document")
+    extracted_entities: List[Dict[str, Any]] = Field(default_factory=list, description="Extracted construction entities")
+    visual_elements: List[Dict[str, Any]] = Field(default_factory=list, description="Visual elements for plans/diagrams")
+    coordinates: Optional[Dict[str, float]] = Field(None, description="Spatial coordinates for location queries")
 
 class ConstructionMetadata(BaseModel):
-    chunks_found: int
-    documents_searched: int
-    processing_time_ms: int
-    document_types_searched: List[str]
-    confidence_breakdown: Dict[str, float]
+    chunks_found: int = Field(..., ge=0, description="Number of relevant chunks found")
+    documents_searched: int = Field(..., ge=0, description="Number of documents searched")
+    processing_time_ms: int = Field(..., ge=0, description="Processing time in milliseconds")
+    document_types_searched: List[str] = Field(default_factory=list, description="Types of documents searched")
+    confidence_breakdown: Dict[str, float] = Field(default_factory=dict, description="Confidence score breakdown")
 
 class EnhancedQuestionRequest(BaseModel):
-    question: str
-    user_language: str
-    document_language: str
-    project_id: str
-    user_id: str
-    document_context: List[DocumentChunk]
-    metadata: ConstructionMetadata
-    query_type: Optional[str] = None  # location, maintenance, specifications, etc.
+    question: str = Field(..., min_length=1, description="The construction-related question")
+    user_language: str = Field(default="English", description="Preferred response language")
+    document_language: str = Field(default="English", description="Language of source documents")
+    project_id: str = Field(..., description="Unique identifier for the construction project")
+    user_id: str = Field(..., description="Unique identifier for the user")
+    document_context: List[DocumentChunk] = Field(..., description="Relevant document chunks")
+    metadata: ConstructionMetadata = Field(..., description="Search metadata")
+    query_type: Optional[str] = Field(None, description="Type of query (location, maintenance, specifications, etc.)")
+
+class QuestionResponse(BaseModel):
+    answer: str = Field(..., description="The generated answer")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score")
+    sources: List[Dict[str, Any]] = Field(..., description="Source information")
+    suggested_next_questions: List[str] = Field(default_factory=list, description="Related questions")
+    query_type: str = Field(..., description="Classified query type")
+    processing_time_ms: float = Field(..., description="Processing time")
+    chunks_analyzed: int = Field(..., description="Number of chunks analyzed")
+    document_types_used: List[str] = Field(default_factory=list, description="Document types used")
 
 # ---------- Construction-Specific NLP ----------
 class ConstructionNLP:
@@ -79,6 +111,7 @@ class ConstructionNLP:
         ]
 
     def classify_query(self, question: str) -> str:
+        """Classify the type of construction query."""
         question_lower = question.lower()
         
         # Location queries
@@ -289,57 +322,76 @@ def build_construction_context(chunks: List[DocumentChunk], max_chars: int = 320
     
     return "".join(context_parts)
 
-# ---------- Enhanced Route ----------
-@app.post("/ask")
+# ---------- Health Check Endpoint ----------
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "services": {
+            "openai": bool(openai.api_key),
+            "sentence_transformer": construction_embedder is not None,
+            "chromadb": chroma_client is not None
+        }
+    }
+
+# ---------- Enhanced Main Route ----------
+@app.post("/ask", response_model=QuestionResponse)
 async def ask_construction_question(req: EnhancedQuestionRequest):
+    """Main endpoint for construction document Q&A."""
     if not openai.api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key is not set")
+        raise HTTPException(status_code=500, detail="OpenAI API key is not configured")
 
     start_time = datetime.now()
     
-    # Classify the query
-    query_type = construction_nlp.classify_query(req.question)
-    
-    # Enhanced chunk processing
-    sorted_chunks = sorted(req.document_context, key=lambda c: c.similarity, reverse=True)
-    
-    # Extract entities from chunks if not already done
-    for chunk in sorted_chunks:
-        if not chunk.extracted_entities:
-            chunk.extracted_entities = construction_nlp.extract_construction_entities(chunk.content)
-    
-    # Adaptive similarity threshold based on query type
-    similarity_thresholds = {
-        "location": 0.45,  # Lower threshold for location queries
-        "maintenance": 0.55,
-        "specifications": 0.50,
-        "general": 0.55
-    }
-    
-    threshold = similarity_thresholds.get(query_type, 0.55)
-    relevant_chunks = [c for c in sorted_chunks if c.similarity >= threshold]
-    
-    if not relevant_chunks:
-        # Fallback with lower threshold
-        relevant_chunks = sorted_chunks[:5]
-    
-    # Smart selection based on query type
-    selected_chunks = smart_chunk_selection(relevant_chunks, req.question, query_type, k=12)
-    
-    if not selected_chunks:
-        return {
-            "answer": "I couldn't find relevant information in your construction documents to answer this question. Please try rephrasing your question or check if the relevant documents have been uploaded.",
-            "confidence": 0.0,
-            "sources": [],
-            "suggested_next_questions": [],
-            "query_type": query_type
+    try:
+        # Classify the query
+        query_type = req.query_type or construction_nlp.classify_query(req.question)
+        
+        # Enhanced chunk processing
+        sorted_chunks = sorted(req.document_context, key=lambda c: c.similarity, reverse=True)
+        
+        # Extract entities from chunks if not already done
+        for chunk in sorted_chunks:
+            if not chunk.extracted_entities:
+                chunk.extracted_entities = construction_nlp.extract_construction_entities(chunk.content)
+        
+        # Adaptive similarity threshold based on query type
+        similarity_thresholds = {
+            "location": 0.45,  # Lower threshold for location queries
+            "maintenance": 0.55,
+            "specifications": 0.50,
+            "general": 0.55
         }
+        
+        threshold = similarity_thresholds.get(query_type, 0.55)
+        relevant_chunks = [c for c in sorted_chunks if c.similarity >= threshold]
+        
+        if not relevant_chunks:
+            # Fallback with lower threshold
+            relevant_chunks = sorted_chunks[:5]
+        
+        # Smart selection based on query type
+        selected_chunks = smart_chunk_selection(relevant_chunks, req.question, query_type, k=12)
+        
+        if not selected_chunks:
+            return QuestionResponse(
+                answer="I couldn't find relevant information in your construction documents to answer this question. Please try rephrasing your question or check if the relevant documents have been uploaded.",
+                confidence=0.0,
+                sources=[],
+                suggested_next_questions=[],
+                query_type=query_type,
+                processing_time_ms=0.0,
+                chunks_analyzed=0,
+                document_types_used=[]
+            )
 
-    # Build enhanced context
-    context_text = build_construction_context(selected_chunks, max_chars=35000)
-    
-    # Construction-specialized system prompt
-    system_prompt = f"""You are a specialized construction handover documentation assistant with expertise in building systems, maintenance, and construction plans. Your role is to help homeowners understand their property based on their construction documentation.
+        # Build enhanced context
+        context_text = build_construction_context(selected_chunks, max_chars=35000)
+        
+        # Construction-specialized system prompt
+        system_prompt = f"""You are a specialized construction handover documentation assistant with expertise in building systems, maintenance, and construction plans. Your role is to help homeowners understand their property based on their construction documentation.
 
 EXPERTISE AREAS:
 - Building plans and blueprints interpretation
@@ -360,11 +412,11 @@ RESPONSE REQUIREMENTS:
 
 QUERY TYPE: {query_type}"""
 
-    # Enhanced user prompt based on query type
-    user_prompt_base = f"Question (answer in {req.user_language}): {req.question}\n\n"
-    
-    if query_type == "location":
-        user_prompt_additions = """
+        # Enhanced user prompt based on query type
+        user_prompt_base = f"Question (answer in {req.user_language}): {req.question}\n\n"
+        
+        if query_type == "location":
+            user_prompt_additions = """
 LOCATION QUERY - Special Instructions:
 - Look for floor plans, site plans, and technical drawings
 - Identify specific rooms, floors, or areas
@@ -372,8 +424,8 @@ LOCATION QUERY - Special Instructions:
 - Include access instructions if available
 - Note any special tools or keys required
 """
-    elif query_type == "maintenance":
-        user_prompt_additions = """
+        elif query_type == "maintenance":
+            user_prompt_additions = """
 MAINTENANCE QUERY - Special Instructions:
 - Extract specific schedules and frequencies
 - List required tools or materials
@@ -381,34 +433,55 @@ MAINTENANCE QUERY - Special Instructions:
 - Note warranty implications
 - Mention professional service requirements
 """
-    else:
-        user_prompt_additions = ""
-    
-    user_prompt = (
-        user_prompt_base +
-        user_prompt_additions +
-        f"\nCONTEXT:\n{context_text}\n\n" +
-        """RESPONSE FORMAT:
+        else:
+            user_prompt_additions = ""
+        
+        user_prompt = (
+            user_prompt_base +
+            user_prompt_additions +
+            f"\nCONTEXT:\n{context_text}\n\n" +
+            """RESPONSE FORMAT:
 - Be comprehensive but concise
 - Include inline citations [filename:chunk]
 - If working with plans, describe locations with clear reference points
 - End with "Suggested next questions:" followed by 3-4 relevant questions
 - If context is insufficient, list specific missing information needed"""
-    )
-
-    try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4o",
-            temperature=0.1,  # Slightly higher for more natural responses
-            max_tokens=1000,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
         )
-        full_response = completion.choices[0].message["content"].strip()
-        
+
+        # Updated OpenAI API call (compatible with newer versions)
+        try:
+            completion = openai.ChatCompletion.create(
+                model="gpt-4o",
+                temperature=0.1,  # Slightly higher for more natural responses
+                max_tokens=1000,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            full_response = completion.choices[0].message["content"].strip()
+            
+        except AttributeError:
+            # Fallback for newer OpenAI client versions
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=openai.api_key)
+                completion = client.chat.completions.create(
+                    model="gpt-4o",
+                    temperature=0.1,
+                    max_tokens=1000,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                full_response = completion.choices[0].message.content.strip()
+            except Exception as e:
+                logger.error(f"OpenAI API error with new client: {e}")
+                raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
+            
     except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
         raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
 
     # Process response
@@ -417,18 +490,21 @@ MAINTENANCE QUERY - Special Instructions:
     
     marker = "Suggested next questions:"
     if marker in full_response:
-        answer, tail = full_response.split(marker, 1)
-        suggested_next_questions = [
-            x.strip(" -•\t").strip()
-            for x in tail.strip().split("\n")
-            if x.strip() and len(x.strip()) > 5
-        ][:4]
+        try:
+            answer, tail = full_response.split(marker, 1)
+            suggested_next_questions = [
+                x.strip(" -•\t").strip()
+                for x in tail.strip().split("\n")
+                if x.strip() and len(x.strip()) > 5
+            ][:4]
+        except Exception as e:
+            logger.warning(f"Error processing suggested questions: {e}")
 
     # Enhanced confidence calculation
     processing_time = (datetime.now() - start_time).total_seconds() * 1000
     
     # Multi-factor confidence scoring
-    similarity_avg = sum(c.similarity for c in selected_chunks) / len(selected_chunks)
+    similarity_avg = sum(c.similarity for c in selected_chunks) / len(selected_chunks) if selected_chunks else 0.0
     
     # Query type confidence adjustment
     type_confidence_boost = {
@@ -464,14 +540,33 @@ MAINTENANCE QUERY - Special Instructions:
         }
         sources.append(source_info)
 
+    return QuestionResponse(
+        answer=answer.strip(),
+        confidence=round(confidence, 3),
+        sources=sources[:10],
+        suggested_next_questions=suggested_next_questions,
+        query_type=query_type,
+        processing_time_ms=round(processing_time, 2),
+        chunks_analyzed=len(selected_chunks),
+        document_types_used=list(set(c.document_type for c in selected_chunks))
+    )
+
+# ---------- Additional Utility Endpoints ----------
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
     return {
-        "answer": answer.strip(),
-        "confidence": round(confidence, 3),
-        "sources": sources[:10],
-        "suggested_next_questions": suggested_next_questions,
-        "query_type": query_type,
-        "processing_time_ms": round(processing_time, 2),
-        "chunks_analyzed": len(selected_chunks),
-        "document_types_used": list(set(c.document_type for c in selected_chunks))
+        "name": "Construction Document Q&A API",
+        "version": "1.0.0",
+        "description": "Specialized API for construction handover documentation assistance",
+        "endpoints": {
+            "health": "/health",
+            "ask": "/ask",
+            "docs": "/docs"
+        }
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
