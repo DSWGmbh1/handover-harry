@@ -1,49 +1,81 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
-import openai
+from __future__ import annotations
+
 import os
 import re
+import json
+import logging
 from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
 
-# Set your OpenAI API Key securely via environment variable
+import openai
+
+# ---------------------------
+# Setup
+# ---------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("handab-backend")
+
+app = FastAPI(title="HandAb Assistant API", version="2.0.0")
+
+# OpenAI (or compatible OpenRouter with OpenAI SDK-compatible endpoint)
 openai.api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+if not openai.api_key:
+    log.warning("OPENAI_API_KEY is not set. /ask will fail until it is configured.")
 
-# ---------- Data Models ----------
+# ---------------------------
+# Request/Response Models
+# ---------------------------
 
 class DocumentChunk(BaseModel):
-    content: str
-    filename: str
-    chunk_index: int
-    similarity: float
-    page: Optional[int] = None
-    heading: Optional[str] = None
-    document_type: Optional[str] = None
+    content: str = Field(..., description="Chunk text")
+    filename: str = Field(..., description="Source filename")
+    chunk_index: int = Field(..., description="Index of the chunk within the doc")
+    similarity: float = Field(..., ge=0.0, le=1.0, description="Retriever similarity")
+    document_type: Optional[str] = Field(None, description="manual, plan, warranty, ...")
+    page: Optional[int] = Field(None, description="Original PDF page number (1-based if possible)")
+    heading: Optional[str] = Field(None, description="Nearest section/heading text for this chunk")
+    language_detected: Optional[str] = Field(None, description="Language of the chunk, if known")
+    section_types: Optional[List[str]] = Field(default_factory=list, description="Detected categories (hvac, electrical, etc.)")
+    extracted_entities: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    visual_elements: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+
+    @validator("content")
+    def strip_content(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Chunk content is empty")
+        return v
 
 
-class Metadata(BaseModel):
-    chunks_found: int
-    documents_searched: int
-    processing_time_ms: int
+class ConstructionMetadata(BaseModel):
+    chunks_found: int = 0
+    documents_searched: int = 0
+    processing_time_ms: int = 0
+    document_types_searched: List[str] = Field(default_factory=list)
+    confidence_breakdown: Dict[str, float] = Field(default_factory=dict)
 
 
-class QuestionRequest(BaseModel):
+class AskRequest(BaseModel):
     question: str
-    user_language: str
-    document_language: Optional[str] = None
-    project_id: Optional[str] = None
-    user_id: Optional[str] = None
+    user_language: str = "English"
+    project_id: str
+    user_id: str
     document_context: List[DocumentChunk]
-    metadata: Metadata
+    metadata: Optional[ConstructionMetadata] = None
+    query_type: Optional[str] = Field(
+        None, description="location | maintenance | specifications | general"
+    )
 
 
-class QuestionResponse(BaseModel):
+class AskResponse(BaseModel):
     answer: str
     confidence: float
-    sources: List[dict]
+    sources: List[Dict[str, Any]]
     suggested_next_questions: List[str]
     query_type: str
     processing_time_ms: float
@@ -51,188 +83,295 @@ class QuestionResponse(BaseModel):
     document_types_used: List[str]
 
 
-# ---------- Helper: Detect query type ----------
+# ---------------------------
+# Query classification (quick, robust)
+# ---------------------------
+_Q_LOC = re.compile(r"\b(where|located|position|find|standort|wo|ubicat|ubicación|dove)\b", re.I)
+_Q_MAINT = re.compile(r"\b(maintain|maintenance|service|schedule|how often|interval|wechsel|tauschen|wartung|entretien|manutenzione)\b", re.I)
+_Q_SPEC = re.compile(r"\b(model|serial|part|capacity|rating|size|dimensions|voltage|amperage|wattage|btu|spec|iso|en\s?779|16890|class|klasse)\b", re.I)
 
-def detect_query_type(question: str) -> str:
-    q = question.lower()
-    if any(k in q for k in ["maintain", "service", "wartung", "pflege", "maintenance", "interval", "wechsel"]):
-        return "maintenance"
-    if any(k in q for k in ["replace", "change", "tauschen", "austausch"]):
-        return "replacement"
-    if any(k in q for k in ["install", "mount", "einbauen", "installation"]):
-        return "installation"
-    if any(k in q for k in ["where", "wo ", "location", "standort"]):
-        return "location"
-    if any(k in q for k in ["filter", "filterklasse", "hepa", "iso 16890", "en 779"]):
-        return "filter_specs"
+def classify_query(q: str) -> str:
+    if _Q_LOC.search(q): return "location"
+    if _Q_MAINT.search(q): return "maintenance"
+    if _Q_SPEC.search(q): return "specifications"
     return "general"
 
 
-# ---------- Main Endpoint ----------
+# ---------------------------
+# Re-ranking with heading/page boosts
+# ---------------------------
 
-@app.post("/ask", response_model=QuestionResponse)
-async def ask_question(req: QuestionRequest):
-    started = datetime.utcnow()
+def _normalize(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
 
-    if not openai.api_key:
-        return QuestionResponse(
-            answer="",
-            confidence=0.0,
-            sources=[],
-            suggested_next_questions=[],
-            query_type="error",
-            processing_time_ms=0.0,
-            chunks_analyzed=0,
-            document_types_used=[]
-        )
+def _tokenize(s: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9äöüÄÖÜßéèêàáíóúç\-]+", s.lower())
 
-    query_type = detect_query_type(req.question)
+def score_chunk(
+    chunk: DocumentChunk,
+    query: str,
+    query_type: str,
+    median_page: Optional[float]
+) -> float:
+    # base: retriever similarity
+    score = 0.78 * float(chunk.similarity)
 
-    # --- Step 1: sort by similarity ---
-    sorted_chunks = sorted(req.document_context, key=lambda c: c.similarity, reverse=True)
+    q = _normalize(query)
+    heading = _normalize(chunk.heading)
 
-    # Adjust thresholds based on query type
+    q_terms = set(_tokenize(q))
+    h_terms = set(_tokenize(heading))
+    c_terms = set(_tokenize(chunk.content[:600]))  # look at the first 600 chars
+
+    # heading boost: if heading shares content words with query
+    overlap_h = len(q_terms & h_terms)
+    if overlap_h > 0:
+        score += 0.10 * min(1.0, overlap_h / 3.0)
+
+    # keyword presence boost (chunk body)
+    overlap_c = len(q_terms & c_terms)
+    if overlap_c > 0:
+        score += 0.06 * min(1.0, overlap_c / 5.0)
+
+    # page proximity (helps when user mentions "page 12" or we cluster around median)
+    page_hint = None
+    m = re.search(r"\bpage\s*(\d{1,3})\b", q)
+    if m:
+        try:
+            page_hint = int(m.group(1))
+        except Exception:
+            page_hint = None
+
+    if page_hint and chunk.page:
+        # exact or near-exact page gets a nudge
+        diff = abs(int(chunk.page) - page_hint)
+        score += 0.06 * max(0.0, 1.0 - min(diff, 5) / 5.0)
+    elif median_page is not None and chunk.page is not None:
+        # keep related pages together slightly
+        diff = abs(int(chunk.page) - int(median_page))
+        score += 0.03 * max(0.0, 1.0 - min(diff, 8) / 8.0)
+
+    # light domain/taxonomy nudge
     if query_type == "maintenance":
-        threshold = 0.50
-    elif query_type == "location":
-        threshold = 0.45
-    elif query_type == "general":
-        threshold = 0.55
-    else:
-        threshold = 0.50
+        if any(w in c_terms for w in ("filter", "filterwechsel", "entretien", "manutenzione", "wartung", "schedule", "interval")):
+            score += 0.03
 
-    candidate_chunks = [c for c in sorted_chunks if c.similarity >= threshold][:50]
+    return float(min(score, 1.0))
 
-    if not candidate_chunks:
-        duration = (datetime.utcnow() - started).total_seconds() * 1000.0
-        return QuestionResponse(
-            answer="",
-            confidence=0.0,
-            sources=[],
-            suggested_next_questions=[],
-            query_type=query_type,
-            processing_time_ms=round(duration, 2),
-            chunks_analyzed=0,
-            document_types_used=[]
+
+def rerank_chunks(chunks: List[DocumentChunk], query: str, query_type: str, top_k: int = 12) -> List[DocumentChunk]:
+    pages = [c.page for c in chunks if c.page is not None]
+    median_page = None
+    if pages:
+        pages_sorted = sorted(pages)
+        n = len(pages_sorted)
+        median_page = pages_sorted[n // 2] if n % 2 else (pages_sorted[n // 2 - 1] + pages_sorted[n // 2]) / 2.0
+
+    scored: List[Tuple[float, DocumentChunk]] = []
+    for c in chunks:
+        scored.append((score_chunk(c, query, query_type, median_page), c))
+
+    # stable sort by (score DESC, similarity DESC)
+    scored.sort(key=lambda x: (x[0], x[1].similarity), reverse=True)
+
+    # de-duplicate by filename+page to avoid spammy repeats
+    seen = set()
+    result: List[DocumentChunk] = []
+    for s, c in scored:
+        key = (c.filename, c.page)
+        if key not in seen:
+            seen.add(key)
+            result.append(c)
+        if len(result) >= top_k:
+            break
+    return result
+
+
+# ---------------------------
+# Context builder with citations
+# ---------------------------
+
+def build_context(chunks: List[DocumentChunk], limit_chars: int = 32000) -> str:
+    parts = []
+    total = 0
+    for c in chunks:
+        tag = f"[{c.filename}"
+        if c.page is not None:
+            tag += f" · p.{c.page}"
+        if c.heading:
+            clean_h = c.heading.strip().replace("\n", " ")
+            tag += f" · {clean_h[:100]}"
+        tag += f" · chunk {c.chunk_index}]"
+
+        section = f"{tag}\n{c.content.strip()}\n"
+        if total + len(section) > limit_chars:
+            break
+        parts.append(section)
+        total += len(section)
+    return "\n\n".join(parts)
+
+
+# ---------------------------
+# System Prompt
+# ---------------------------
+
+def system_prompt(query_type: str) -> str:
+    extras = ""
+    if query_type == "maintenance":
+        extras = (
+            "- If the context provides maintenance **intervals**, **frequencies**, or **procedures**, list them explicitly.\n"
+            "- Prefer exact statements over paraphrase. If the context shows **Filterwartung** or **Filterwechsel** steps, include them.\n"
         )
+    elif query_type == "location":
+        extras = (
+            "- Be specific about floors/rooms/areas if provided. Use plan references.\n"
+        )
+    elif query_type == "specifications":
+        extras = "- Prefer formal designations (e.g., ISO 16890 ePM1 50%, EN 779 F7) exactly as written.\n"
 
-    # --- Step 2: rerank (optional but helps) ---
-    def chunk_score(c: DocumentChunk) -> float:
-        score = c.similarity
-        if query_type == "filter_specs" and re.search(r"(filter|klasse|iso|en\s?779|hepa)", c.content, re.I):
-            score += 0.05
-        if query_type == "maintenance" and re.search(r"(maint|service|wartung|interval|wechsel)", c.content, re.I):
-            score += 0.05
-        return score
+    return f"""You are a specialist assistant for construction handover documentation.
+Use ONLY the information in the CONTEXT to answer. If info is missing, say:
+"The provided documents do not contain enough information to answer this question."
 
-    candidate_chunks = sorted(candidate_chunks, key=chunk_score, reverse=True)[:12]
+General rules:
+- Answer clearly in the user's language.
+- Quote exact spec words when possible (e.g., filter classes, standards).
+- Include inline citations using the [filename · p.X · heading · chunk N] labels that precede each context block.
+- If multiple places conflict, say that and present both with citations.
+- Finish with 3-4 "Suggested next questions".
 
-    # --- Step 3: build context ---
-    context_text = ""
-    for c in candidate_chunks:
-        heading_txt = f"[{c.heading}] " if c.heading else ""
-        page_txt = f"(p.{c.page}) " if c.page else ""
-        context_text += f"From '{c.filename}' {page_txt}chunk {c.chunk_index} (similarity {c.similarity:.2f}): {heading_txt}{c.content}\n\n"
-
-    # --- Step 4: system prompt ---
-    system_prompt = f"""
-You are a highly accurate assistant for construction handover documentation.
-Answer ONLY using the provided CONTEXT. Quote exact sentences when possible.
-
-Rules:
-- Always answer in {req.user_language}.
-- If a clear, exact answer exists in CONTEXT, quote it first.
-- If not found, say: "Not stated in the documents I can access."
-- Avoid guessing.
-- Be specific: include maintenance intervals, specs, model numbers, locations.
-- Suggested questions should help the user explore related info.
-
---- CONTEXT START ---
-{context_text}
---- CONTEXT END ---
+Additional guidance for this query type ({query_type}):
+{extras}
 """
 
-    # --- Step 5: Call GPT ---
+
+# ---------------------------
+# /health
+# ---------------------------
+
+@app.get("/health")
+def health():
+    return {"ok": True, "openai": bool(openai.api_key), "model": OPENAI_MODEL, "ts": datetime.utcnow().isoformat()}
+
+
+# ---------------------------
+# /ask
+# ---------------------------
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    if not openai.api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+
+    start = datetime.utcnow()
+
+    qtype = req.query_type or classify_query(req.question)
+    # filter out empty/very low similarity chunks (keep some recall)
+    raw_chunks = [c for c in req.document_context if c.content and c.similarity >= 0.35]
+
+    if not raw_chunks:
+        return AskResponse(
+            answer="I couldn't find enough relevant passages in the documents to answer. Please try rephrasing or upload clearer documents.",
+            confidence=0.0,
+            sources=[],
+            suggested_next_questions=[],
+            query_type=qtype,
+            processing_time_ms=0.0,
+            chunks_analyzed=0,
+            document_types_used=[],
+        )
+
+    # Re-rank with heading/page boosts
+    selected = rerank_chunks(raw_chunks, req.question, qtype, top_k=12)
+
+    # Build context with rich citations
+    context = build_context(selected, limit_chars=32000)
+
+    sys_prompt = system_prompt(qtype)
+    user_prompt = (
+        f"User question (respond in {req.user_language}): {req.question}\n\n"
+        f"--- CONTEXT START ---\n{context}\n--- CONTEXT END ---\n\n"
+        "Respond using ONLY the context above. Include the inline citation labels exactly as [filename · p.X · heading · chunk N] "
+        "after the facts you cite. End with a line that starts with 'Suggested next questions:' followed by 3-4 short bullets."
+    )
+
+    # Call model
     try:
         completion = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": req.question}
-            ],
+            model=OPENAI_MODEL,
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1000,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        full_response_text = completion.choices[0].message["content"].strip()
+        full = completion.choices[0].message["content"].strip()
     except Exception as e:
-        duration = (datetime.utcnow() - started).total_seconds() * 1000.0
-        return QuestionResponse(
-            answer="",
-            confidence=0.0,
-            sources=[],
-            suggested_next_questions=[],
-            query_type="error",
-            processing_time_ms=round(duration, 2),
-            chunks_analyzed=len(candidate_chunks),
-            document_types_used=list({c.document_type for c in candidate_chunks if c.document_type})
-        )
+        log.exception("OpenAI error")
+        raise HTTPException(status_code=500, detail=f"OpenAI API error: {e}")
 
-    # --- Step 6: extract suggested questions ---
+    # Split suggested next questions if present
     suggestions: List[str] = []
-    try:
-        marker = "Suggested next questions:"
-        if marker in full_response_text:
-            _, tail = full_response_text.split(marker, 1)
-            suggestions = [x.strip(" -•\t").strip() for x in tail.strip().split("\n") if x.strip()]
-            suggestions = [s for s in suggestions if len(s) > 5][:4]
-    except Exception:
-        pass
+    marker = "Suggested next questions:"
+    answer = full
+    if marker in full:
+        try:
+            answer, tail = full.split(marker, 1)
+            suggestions = [
+                s.strip(" -•\t").strip()
+                for s in tail.strip().split("\n")
+                if len(s.strip()) > 3
+            ][:4]
+        except Exception:
+            pass
 
-    # --- Step 7: confidence ---
-    sim_avg = sum(c.similarity for c in candidate_chunks) / max(1, len(candidate_chunks))
-    confidence = min(1.0, max(0.0, 0.65 * sim_avg + 0.25))
+    # Confidence: blend of similarity + heading boost achieved in rerank
+    avg_sim = sum(c.similarity for c in selected) / max(1, len(selected))
+    confidence = max(0.0, min(1.0, 0.75 * avg_sim + 0.15))  # conservative nudge
 
-    # --- Step 8: NEW — Grounded check for fallback ---
-    grounded = (
-        ('Exact quote:' in full_response_text)
-        and (len(re.sub(r'(?i)Exact quote:\s*', '', full_response_text).strip()) > 0)
-        and ('Not stated in the documents I can access' not in full_response_text)
-    )
+    # Sources
+    sources = []
+    for c in selected[:10]:
+        sources.append({
+            "filename": c.filename,
+            "page": c.page,
+            "heading": c.heading,
+            "chunk_index": c.chunk_index,
+            "similarity": round(float(c.similarity), 3),
+            "document_type": c.document_type,
+        })
 
-    if not grounded and sim_avg < 0.42:
-        # Force Lovable to fallback to OpenRouter by returning empty
-        duration = (datetime.utcnow() - started).total_seconds() * 1000.0
-        return QuestionResponse(
-            answer="",
-            confidence=0.0,
-            sources=[],
-            suggested_next_questions=[],
-            query_type=query_type,
-            processing_time_ms=round(duration, 2),
-            chunks_analyzed=len(candidate_chunks),
-            document_types_used=list({c.document_type for c in candidate_chunks if c.document_type})
-        )
-
-    # --- Step 9: return grounded answer ---
-    srcs = [{
-        "filename": c.filename,
-        "chunk_index": c.chunk_index,
-        "similarity": round(c.similarity, 3),
-        "page": c.page,
-        "heading": c.heading
-    } for c in candidate_chunks[:8]]
-
-    duration = (datetime.utcnow() - started).total_seconds() * 1000.0
-    return QuestionResponse(
-        answer=full_response_text.strip(),
+    dur_ms = (datetime.utcnow() - start).total_seconds() * 1000.0
+    return AskResponse(
+        answer=answer.strip(),
         confidence=round(confidence, 3),
-        sources=srcs,
+        sources=sources,
         suggested_next_questions=suggestions,
-        query_type=query_type,
-        processing_time_ms=round(duration, 2),
-        chunks_analyzed=len(candidate_chunks),
-        document_types_used=list({c.document_type for c in candidate_chunks if c.document_type})
+        query_type=qtype,
+        processing_time_ms=round(dur_ms, 2),
+        chunks_analyzed=len(selected),
+        document_types_used=sorted(list({c.document_type for c in selected if c.document_type})),
     )
+
+
+# ---------------------------
+# Root
+# ---------------------------
+
+@app.get("/")
+def root():
+    return {
+        "name": "HandAb Assistant API",
+        "version": "2.0.0",
+        "endpoints": {"health": "/health", "ask": "/ask"},
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
 
 
 
